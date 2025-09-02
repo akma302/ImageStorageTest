@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">ImageStorageTest</string>
+    <string name="image_select">Выбрать из галереи</string>
+    <string name="image_load">Загрузить из провайдера</string>
+</resources>
