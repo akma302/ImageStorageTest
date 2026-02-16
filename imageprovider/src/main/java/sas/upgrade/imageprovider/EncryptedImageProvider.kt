@@ -1,5 +1,6 @@
 package sas.upgrade.imageprovider
 
+import android.annotation.SuppressLint
 import android.content.ContentProvider
 import android.content.ContentValues
 import android.content.UriMatcher
@@ -8,6 +9,8 @@ import android.database.MatrixCursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.provider.BaseColumns
 import android.util.Log
@@ -33,6 +36,18 @@ class EncryptedImageProvider : ContentProvider() {
     private val cryptoManager = CryptoManager()
     private lateinit var storageDir: File
 
+    // Delegated functional interfaces for improved logic
+    private val fileOperations: FileOperations by FileOperationsDelegate()
+    private val tempFileManager: TempFileManager by TempFileManagerDelegate()
+    private val encryptionHandler: EncryptionHandler by EncryptionHandlerDelegate()
+    private val fileValidator: FileValidator by FileValidatorDelegate()
+
+    // Handler for cleanup callbacks (used by tempFileManager)
+    private val cleanupHandlerThread by lazy {
+        android.os.HandlerThread("TempFileCleanup").apply { start() }
+    }
+    private val cleanupHandler by lazy { Handler(cleanupHandlerThread.looper) }
+
     private val uriMatcher = UriMatcher(UriMatcher.NO_MATCH).apply {
         addURI(
             ImageContract.AUTHORITY,
@@ -52,6 +67,7 @@ class EncryptedImageProvider : ContentProvider() {
         db = object : SQLiteOpenHelper(context, "images.db", null, 1) {
 
             override fun onCreate(db: SQLiteDatabase) {
+
                 db.execSQL(
                     """
                     CREATE TABLE $TABLE(
@@ -82,9 +98,10 @@ class EncryptedImageProvider : ContentProvider() {
             ?: System.currentTimeMillis()
 
         // базовая валидация имени (path traversal)
-        require(!name.contains("..") && !name.contains("/") && !name.contains("\\")) {
-            "Invalid file name: $name"
-        }
+        // require(!name.contains("..") && !name.contains("/") && !name.contains("\\")) {
+        //     "Invalid file name: $name"
+        // }
+        fileValidator.validateFileName(name)
 
         // пишем/обновляем метаданные
         val row = ContentValues().apply {
@@ -109,19 +126,50 @@ class EncryptedImageProvider : ContentProvider() {
         val imageName = uri.lastPathSegment
             ?: throw IllegalArgumentException("Missing file name")
 
-        val encryptedFile = File(storageDir, imageName)
-        if (!encryptedFile.exists()) {
-            throw FileNotFoundException("File not found: $imageName")
+        // IMPROVED: throw FileNotFoundException for read mode instead of creating empty file
+        val encryptedFile = if (mode.contains("r")) {
+            fileOperations.getFileForRead(storageDir, imageName)
+        } else {
+            File(storageDir, imageName).apply { if (!exists()) createNewFile() }
         }
+
+        // val encryptedFile = File(storageDir, imageName)
+        // if (!encryptedFile.exists()) {
+        //     encryptedFile.createNewFile()
+        //     // throw FileNotFoundException("File not found: $imageName")
+        // }
 
         // Запись в файл
         if (mode.contains("w")) {
-            return ParcelFileDescriptor.open(
-                encryptedFile,
-                ParcelFileDescriptor.MODE_WRITE_ONLY or
-                        ParcelFileDescriptor.MODE_CREATE or
-                        ParcelFileDescriptor.MODE_TRUNCATE
-            )
+
+            val tempFile = File.createTempFile("enc_", null, context?.cacheDir)
+            tempFile.deleteOnExit()
+
+            // IMPROVED: removed unused fileDescriptor, use background thread for encryption
+            return encryptionHandler.openForEncryptedWrite(tempFile, encryptedFile, cryptoManager)
+
+            // val fileDescriptor = ParcelFileDescriptor.open(
+            //     encryptedFile,
+            //     ParcelFileDescriptor.MODE_WRITE_ONLY or
+            //             ParcelFileDescriptor.MODE_CREATE or
+            //             ParcelFileDescriptor.MODE_TRUNCATE
+            // )
+
+            // return ParcelFileDescriptor.open(
+            //     tempFile,
+            //     ParcelFileDescriptor.MODE_WRITE_ONLY or
+            //             ParcelFileDescriptor.MODE_CREATE or
+            //             ParcelFileDescriptor.MODE_TRUNCATE,
+            //     Handler(Looper.getMainLooper()), // Handler (можно null — listener вызовется в Binder потоке)
+            //     ParcelFileDescriptor.OnCloseListener {
+            //         try {
+            //             // когда клиент закрыл дескриптор -> зашифровать во "взрослый" файл
+            //             cryptoManager.encrypt(tempFile, encryptedFile)
+            //         } finally {
+            //             tempFile.delete()
+            //         }
+            //     }
+            // )
         }
 
         // Чтение из файла
@@ -141,12 +189,16 @@ class EncryptedImageProvider : ContentProvider() {
                 cryptoManager.decrypt(encryptedFile, tempFile)
             }
 
-            return ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
+            // IMPROVED: auto-delete temp file when client closes descriptor
+            return tempFileManager.openTempFileWithCleanup(tempFile, cleanupHandler)
+
+            // return ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
         }
 
         throw IllegalArgumentException("Unsupported mode: $mode")
     }
 
+    @SuppressLint("Recycle")
     override fun query(
         uri: Uri,
         projection: Array<out String>?,
@@ -188,7 +240,7 @@ class EncryptedImageProvider : ContentProvider() {
                 val args =
                     arrayListOf(name).apply { selectionArgs?.let { addAll(it) } }.toTypedArray()
 
-                val c = db.query(
+                db.query(
                     TABLE,
                     proj,
                     sel,
@@ -196,9 +248,9 @@ class EncryptedImageProvider : ContentProvider() {
                     null,
                     null,
                     sortOrder
-                )
-                c.setNotificationUri(requireNotNull(context).contentResolver, uri)
-                c
+                ).apply {
+                    setNotificationUri(requireNotNull(context).contentResolver, uri)
+                }
             }
 
             else -> throw IllegalArgumentException("Unknown URI $uri")
