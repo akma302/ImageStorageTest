@@ -1,10 +1,6 @@
 package sas.upgrade.imagestoragetest.ui.screen
 
-import android.content.ContentValues
-import android.content.Context
-import android.database.Cursor
 import android.net.Uri
-import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -16,6 +12,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -36,10 +33,6 @@ import coil.compose.rememberAsyncImagePainter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import sas.upgrade.imageprovider.ImageContract
-import androidx.compose.foundation.lazy.items
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 data class ImageItem(
     val name: String,
@@ -48,15 +41,20 @@ data class ImageItem(
 )
 
 @Composable
-fun MainScreen() {
-    val context = LocalContext.current
+fun MainScreen(
+    // Inject use case for testability and separation of concerns
+    useCase: MainScreenUseCase = MainScreenUseCaseImpl(
+        repository = MainScreenRepositoryImpl(LocalContext.current)
+    )
+) {
     val scope = rememberCoroutineScope()
 
     var imageList by remember { mutableStateOf(listOf<ImageItem>()) }
     var selectedImage by remember { mutableStateOf<Uri?>(null) }
 
     fun loadImages() {
-        imageList = queryImages(context)
+        // Delegate to use case for loading images
+        imageList = useCase.loadImages()
     }
 
     LaunchedEffect(Unit) {
@@ -68,7 +66,8 @@ fun MainScreen() {
     ) { uri: Uri? ->
         uri?.let {
             scope.launch(Dispatchers.IO) {
-                saveImageToProvider(context, it)
+                // Delegate to use case for saving image
+                useCase.saveImage(it)
                 loadImages()
             }
         }
@@ -109,13 +108,15 @@ fun MainScreen() {
                         Column {
                             Text(text = image.name, style = MaterialTheme.typography.bodyLarge)
                             Text(
-                                text = formatSize(image.sizeBytes) + ", " + formatDate(image.lastModified),
+                                // Delegate to use case for business logic
+                                text = useCase.formatImageDisplayInfo(image),
                                 style = MaterialTheme.typography.bodySmall
                             )
                         }
                         IconButton(onClick = {
                             scope.launch(Dispatchers.IO) {
-                                deleteImageFromProvider(context, image.name)
+                                // Delegate to use case for deleting image
+                                useCase.deleteImage(image.name)
                                 loadImages()
                             }
                         }) {
@@ -126,93 +127,4 @@ fun MainScreen() {
             }
         }
     }
-}
-
-
-private fun queryImages(context: Context): List<ImageItem> {
-    val cursor = context.contentResolver.query(
-        ImageContract.CONTENT_URI,
-        arrayOf(
-            ImageContract.Columns.NAME,
-            ImageContract.Columns.SIZE,
-            ImageContract.Columns.DATE_MODIFIED
-        ),
-        null, null, null
-    )
-    val list = mutableListOf<ImageItem>()
-    cursor?.use {
-        val nameIdx = it.getColumnIndexOrThrow(ImageContract.Columns.NAME)
-        val sizeIdx = it.getColumnIndexOrThrow(ImageContract.Columns.SIZE)
-        val dateIdx = it.getColumnIndexOrThrow(ImageContract.Columns.DATE_MODIFIED)
-
-        while (it.moveToNext()) {
-            val name = it.getString(nameIdx)
-            val size = it.getLong(sizeIdx)
-            val date = it.getLong(dateIdx)
-            list.add(ImageItem(name, size, date))
-        }
-    }
-    return list
-}
-
-private fun formatSize(bytes: Long): String {
-    val kb = bytes / 1024.0
-    return String.format("%.1f KB", kb)
-}
-
-private fun formatDate(timeMs: Long): String {
-    val sdf = SimpleDateFormat("dd MMM yyyy, HH:mm", Locale.getDefault())
-    return sdf.format(Date(timeMs))
-}
-
-
-private fun saveImageToProvider(context: Context, sourceUri: Uri) {
-    val currentTime = System.currentTimeMillis()
-    val fileName = getFileName(context, sourceUri) ?: "image_${currentTime}.jpg"
-
-    var size: Long? = null
-    // Получаем размер и дату модификации
-    val fileStats = context.contentResolver.query(sourceUri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
-        if (cursor.moveToFirst()) {
-            size = cursor.getLongOrNull(cursor.getColumnIndex(OpenableColumns.SIZE))
-        }
-    }
-
-    val values = ContentValues().apply {
-        put(ImageContract.Columns.NAME, fileName)
-        size?.let { put(ImageContract.Columns.SIZE, it) }
-        put(ImageContract.Columns.DATE_MODIFIED, currentTime)
-    }
-
-    // Сохраняем только метаданные через insert
-    val metadataUri = context.contentResolver.insert(ImageContract.CONTENT_URI, values)
-        ?: throw IllegalArgumentException("Failed to insert metadata")
-
-    // Теперь сохраняем сам файл через openFile (или любой поток, который читает исходное изображение и пишет в Provider)
-    context.contentResolver.openOutputStream(metadataUri)?.use { outputStream ->
-        context.contentResolver.openInputStream(sourceUri)?.use { inputStream ->
-            inputStream.copyTo(outputStream)
-        }
-    }
-}
-
-private fun Cursor.getLongOrNull(index: Int): Long? = if (index != -1 && !isNull(index)) getLong(index) else null
-
-private fun deleteImageFromProvider(context: Context, name: String) {
-    val uri = Uri.withAppendedPath(ImageContract.CONTENT_URI, name)
-    context.contentResolver.delete(uri, null, null)
-}
-
-private fun getFileName(context: Context, uri: Uri): String? {
-    var name: String? = null
-    val cursor = context.contentResolver.query(uri, null, null, null, null)
-    cursor?.use {
-        if (it.moveToFirst()) {
-            val index = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            if (index >= 0) {
-                name = it.getString(index)
-            }
-        }
-    }
-    return name
 }
